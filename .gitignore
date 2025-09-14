@@ -1,0 +1,6 @@
+__pycache__/
+/weather_faiss_vectorstore_main/
+faiss_main.bin
+argo_preprocessed_final.csv
+argo_preprocessed.csv
+
