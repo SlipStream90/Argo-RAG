@@ -1,38 +1,60 @@
-Argo-RAG
-Overview
-Argo-RAG is a lightweight Retrieval-Augmented Generation (RAG) system for processing and querying oceanographic data from Argo floats. It uses preprocessed Argo data with date annotations to enable semantic search via embeddings, with an interactive Streamlit dashboard.
-Features
+# RAG_Setup
 
-Data Preprocessing: Processes Argo float data (e.g., temperature, salinity) with dates.
-Embedding Generation: Creates vector embeddings for semantic search.
-RAG Implementation: Main script for RAG functionality.
-Interactive Dashboard: Streamlit-based interface for visualizing and querying data.
+Retrieval-Augmented Generation (RAG) for Oceanographic Data Analysis
 
-Requirements
+## Overview
 
-Python 3.10+
-Dependencies: See requirements.txt (to be created if needed)
-Minimum 4GB RAM
+This project implements a RAG pipeline using FAISS for vector search, HuggingFace and Ollama for LLMs, and custom prompt engineering for oceanographic data. It enables users to query marine datasets and receive expert-level answers with context-aware retrieval.
 
-Setup Instructions
+## Features
 
-Clone the Repository:git clone https://github.com/SlipStream90/Argo-RAG.git
-cd Argo-RAG
+- **Vector Search:** Uses FAISS for fast similarity search over embedded documents.
+- **Embeddings:** Supports HuggingFace and SentenceTransformers for generating document embeddings.
+- **LLM Integration:** Uses Ollama and HuggingFace pipelines for natural language generation.
+- **Custom Prompt:** Tailored for oceanographic data, focusing on measurements, dates, and locations.
+- **Streamlit UI:** (if included) for interactive querying.
 
+## File Structure
 
-Set Up Python Environment:python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-pip install -r requirements.txt  # Include Streamlit and other libraries
+- `RAG_main.py` — Main RAG pipeline and prompt logic.
+- `embed_gen.py` — Embedding generation and vectorstore creation.
+- `app.py` — (Optional) Streamlit user interface.
+- `weather_faiss_vectorstore_main/` — FAISS vectorstore folder (should be ignored in `.gitignore`).
 
+## Setup
 
-Run Embedding Generation:python embed_gen.py
+1. **Clone the repository:**
+   ```
+   git clone https://github.com/<your-username>/<repo-name>.git
+   cd RAG_Setup
+   ```
 
+2. **Install dependencies:**
+   ```
+   pip install -r requirements.txt
+   ```
 
-Launch Streamlit Dashboard:streamlit run app.py
+3. **Download models:**
+   - HuggingFace: `sentence-transformers/all-MiniLM-L6-v2`
+   - Ollama: `qwen3:4b` (ensure Ollama server is running)
 
+4. **Prepare vectorstore:**
+   - Run `embed_gen.py` to generate FAISS index from your data.
 
-Run Main RAG Script:python RAG_main.py
+5. **Run the main pipeline:**
+   ```
+   python RAG_main.py
+   ```
 
+## Usage
+
+- Modify the query in `main(query)` to ask questions about your oceanographic dataset.
+- The system retrieves relevant documents and generates concise, data-driven answers.
+
+## Customization
+
+- Update the prompt template in `RAG_main.py` for your specific data structure.
+- Adjust FAISS search parameters (`k`) for more or fewer context documents.
 
 
 Project Structure
