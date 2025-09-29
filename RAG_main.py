@@ -11,7 +11,7 @@ from langchain.embeddings import OllamaEmbeddings
 from sentence_transformers import SentenceTransformer
 from langchain.prompts import PromptTemplate
 
-model_name_1 = "qwen3:4b"
+model_name_1 = "qwen3:latest"
 
 #hf_pipe=pipeline("text-generation",model=model_main,tokenizer=tokenizer,temperature=0.1,top_p=0.75,max_new_tokens=32000)
 #llm = HuggingFacePipeline(pipeline=hf_pipe)
@@ -99,3 +99,4 @@ def show_retrieved_docs(docs):
 def main(query):
     answer, num_docs, source_docs = run_query(query)
     return answer, num_docs
+
