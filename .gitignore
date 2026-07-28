@@ -4,3 +4,10 @@ faiss_main.bin
 argo_preprocessed_final.csv
 argo_preprocessed.csv
 
+
+# Tests / tooling
+.pytest_cache/
+*.pyc
+
+# Derived retrieval artefacts
+*bm25_cache.pkl

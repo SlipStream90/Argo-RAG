@@ -1,76 +1,107 @@
-# RAG_Setup
+# Argo-RAG
 
-Retrieval-Augmented Generation (RAG) for Oceanographic Data Analysis
+Retrieval-Augmented Generation over Argo oceanographic float profiles.
 
-## Overview
+Ask questions in plain English about temperature, salinity and pressure
+measurements; the pipeline retrieves the relevant profile records and has a
+local LLM answer strictly from them. Everything runs offline.
 
-This project implements a RAG pipeline using FAISS for vector search, HuggingFace and Ollama for LLMs, and custom prompt engineering for oceanographic data. It enables users to query marine datasets and receive expert-level answers with context-aware retrieval.
+## How it works
 
-## Features
+```
+CSV row ──► labelled Document ──► MiniLM embedding ──► FAISS index
+                                                          │
+query ──► date normalisation ──┬──► FAISS (dense, MMR) ───┤
+                               └──► BM25 (lexical) ───────┴──► RRF fusion
+                                                                  │
+                                                       prompt ──► Ollama ──► answer + sources
+```
 
-- **Vector Search:** Uses FAISS for fast similarity search over embedded documents.
-- **Embeddings:** Supports HuggingFace and SentenceTransformers for generating document embeddings.
-- **LLM Integration:** Uses Ollama and HuggingFace pipelines for natural language generation.
-- **Custom Prompt:** Tailored for oceanographic data, focusing on measurements, dates, and locations.
-- **Streamlit UI:** (if included) for interactive querying.
-
-## File Structure
-
-- `RAG_main.py` — Main RAG pipeline and prompt logic.
-- `embed_gen.py` — Embedding generation and vectorstore creation.
-- `app.py` — (Optional) Streamlit user interface.
-- `weather_faiss_vectorstore_main/` — FAISS vectorstore folder (should be ignored in `.gitignore`).
+Retrieval is hybrid: a dense vector search catches paraphrases, BM25 catches
+exact tokens like float ids and ISO dates, and the two ranked lists are merged
+with weighted reciprocal-rank fusion. Queries are rewritten first, so "January
+3rd, 2023" becomes "2023-01-03" and matches the indexed text.
 
 ## Setup
 
-1. **Clone the repository:**
-   ```
-   git clone https://github.com/<your-username>/<repo-name>.git
-   cd RAG_Setup
-   ```
+```bash
+pip install -r requirements.txt
+ollama serve                 # in another terminal
+ollama pull qwen3
 
-2. **Install dependencies:**
-   ```
-   pip install -r requirements.txt
-   ```
+python RAG_main.py --check   # verify prerequisites
+```
 
-3. **Download models:**
-   - HuggingFace: `sentence-transformers/all-MiniLM-L6-v2`
-   - Ollama: `qwen3:4b` (ensure Ollama server is running)
-
-4. **Prepare vectorstore:**
-   - Run `embed_gen.py` to generate FAISS index from your data.
-
-5. **Run the main pipeline:**
-   ```
-   python RAG_main.py
-   ```
+`--check` reports exactly what is missing and how to fix it.
 
 ## Usage
 
-- Modify the query in `main(query)` to ask questions about your oceanographic dataset.
-- The system retrieves relevant documents and generates concise, data-driven answers.
+```bash
+python RAG_main.py "What was the temperature on January 3rd, 2023 near 45N 30W?"
+python RAG_main.py --quiet "salinity at platform 1902029"
+python RAG_main.py --no-bm25 -k 10 "deep profiles in the Southern Ocean"
 
-## Customization
+streamlit run app.py         # dashboard
+```
 
-- Update the prompt template in `RAG_main.py` for your specific data structure.
-- Adjust FAISS search parameters (`k`) for more or fewer context documents.
+Building the index from a CSV:
 
+```bash
+python embed_gen.py                  # full build
+python embed_gen.py --limit 5000     # quick smoke build
+python embed_gen.py --dry-run        # render documents, embed nothing
+```
 
-Project Structure
-Argo-RAG/
-├── .gitignore              # Git ignore file
-├── RAG_main.py             # Main RAG processing script
-├── app.py                  # Streamlit dashboard script
-├── argo_preprocessed_with_dates.csv  # Preprocessed Argo data with dates
-├── embed_gen.py            # Script to generate embeddings
+## Configuration
 
-Usage
+Everything lives in `config.py` and every value has an environment override, so
+no paths are hard-coded:
 
-Dashboard: Access the Streamlit interface at http://localhost:8501 to visualize data and interact with queries.
-RAG Processing: Run RAG_main.py to process data using generated embeddings.
+```bash
+ARGO_TOP_K=10 ARGO_OLLAMA_MODEL=llama3.2 python RAG_main.py "..."
+```
 
+Common knobs: `ARGO_TOP_K`, `ARGO_DENSE_WEIGHT` / `ARGO_LEXICAL_WEIGHT`,
+`ARGO_NUM_CTX`, `ARGO_INDEX_TYPE` (`flat` or `ivf`), `ARGO_VECTORSTORE_PATH`.
 
-Acknowledgements
+## Files
+
+| File | Purpose |
+|---|---|
+| `config.py` | All settings, env-overridable |
+| `retrieval.py` | Date normalisation, RRF fusion, index/BM25 loading |
+| `RAG_main.py` | LCEL chain, prompt, CLI, `main()` used by the dashboard |
+| `embed_gen.py` | Builds the FAISS vectorstore from the CSV |
+| `app.py` | Streamlit dashboard |
+| `tests/` | Unit tests for the retrieval logic (`python -m pytest tests/ -q`) |
+| `Doc_setup.py` | Superseded flan-t5 prototype, kept for reference |
+
+## Known limitations
+
+**Aggregate questions are not computed.** "What was the average temperature?"
+cannot be answered by top-k retrieval — six retrieved rows out of ~150,000 are
+not a representative sample, and averaging them would produce a confident wrong
+number. The pipeline detects these questions and instructs the model to say so
+rather than confabulate. Answering them properly needs a SQL path over the full
+dataset (planned).
+
+**No metadata pre-filtering yet.** Date and bounding-box filters need FAISS
+`IDSelector` support; LangChain's `filter=` argument only post-filters the
+`fetch_k` candidates, so a selective filter usually returns nothing at all.
+
+**The BM25 cache is a pickle**, rebuilt automatically if it fails to load. A
+SQLite FTS5 index would be more robust and would enable filtering in the same
+query.
+
+## Notes on the index
+
+Embeddings are L2-normalised, so inner product is cosine similarity. New builds
+use `IndexFlatIP` (exact search — at this corpus size the IVF approximation
+bought nothing while adding two tuning knobs). An existing L2 index still works
+and returns the same ranking: for unit vectors `||q−d||² = 2 − 2(q·d)`, so L2
+and inner product order results identically. The distance strategy is detected
+from the index itself at load time, so no re-embedding is required.
+
+## Acknowledgements
 
 Argo data from the Global Argo Data Repository.

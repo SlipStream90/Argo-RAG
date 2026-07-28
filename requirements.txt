@@ -1,0 +1,34 @@
+# Argo RAG pipeline — Python 3.11+
+#
+#   python -m pip install -r requirements.txt
+#
+# Generation runs against a local Ollama server (https://ollama.com); it is not
+# a pip package. After installing:  ollama pull qwen3
+
+# Core orchestration. langchain 1.x removed langchain.chains and
+# langchain.retrievers, so the pipeline uses langchain-core primitives (LCEL)
+# directly plus langchain-community for the FAISS and BM25 integrations.
+langchain-core>=1.0,<2.0
+langchain-community>=0.3.0
+langchain-huggingface>=0.3.0
+
+# Vector index and embeddings
+faiss-cpu>=1.8.0
+sentence-transformers>=3.0.0
+
+# Lexical retrieval (BM25Retriever's backend)
+rank-bm25>=0.2.2
+
+# Data loading and query parsing
+pandas>=2.0.0
+numpy>=1.26.0
+dateparser>=1.2.0
+
+# Ollama is called over plain HTTP
+requests>=2.31.0
+
+# UI
+streamlit>=1.40.0
+
+# Tests
+pytest>=8.0.0

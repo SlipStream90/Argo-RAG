@@ -1,159 +1,234 @@
+"""Query-time RAG pipeline over the Argo float corpus.
+
+Hybrid retrieval (dense FAISS + lexical BM25, fused with weighted RRF) feeding
+a local Ollama model through an LCEL chain.
+
+Public entry point, consumed by app.py:
+
+    main(query) -> (answer, num_source_documents)
+
+Everything is built lazily on first query, so importing this module -- which
+Streamlit does at start-up -- no longer blocks for minutes loading a 227 MB
+index, and no longer crashes the whole app if the index is missing.
+"""
+
+from __future__ import annotations
+
+import argparse
 import re
-import dateparser
-from dateparser.search import search_dates
-from langchain.retrievers import EnsembleRetriever
-from langchain_community.retrievers import BM25Retriever
-from langchain_ollama.llms import OllamaLLM
-from langchain_community.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain.chains import RetrievalQA
-from langchain.prompts import PromptTemplate
-from langchain.schema import BaseRetriever, Document
-from langchain.callbacks.manager import CallbackManagerForRetrieverRun
-from pydantic import Field
-from typing import List
+import sys
+from functools import lru_cache
+from typing import List, Tuple
 
-hf_embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2",
-    model_kwargs={"device": "cpu"},
-    encode_kwargs={"normalize_embeddings": True},
+import requests
+from langchain_core.documents import Document
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import RunnableLambda, RunnableParallel, RunnablePassthrough
+
+import config
+from retrieval import (
+    DateAwareRetriever,
+    FusionRetriever,
+    VectorstoreMissingError,
+    build_bm25,
+    iter_documents,
+    load_embeddings,
+    load_vectorstore,
+    looks_like_aggregate,
 )
 
-vectorstore = FAISS.load_local(
-    folder_path="weather_faiss_vectorstore_main",
-    embeddings=hf_embeddings,
-    allow_dangerous_deserialization=True,
-)
-vectorstore.index.nprobe = 10
 
-_FALSE_POSITIVE_PATTERNS = [
-    r"\b\d+\s*(meters?|m|km|PSU|°C|dbar|knots?)\b",
-    r"\b(station|platform|float|id)\s*\d+\b",
-]
-
-def _is_false_positive(text: str, span: str) -> bool:
-    for pattern in _FALSE_POSITIVE_PATTERNS:
-        if re.search(pattern, text, re.IGNORECASE):
-            return True
-    return False
+class LLMUnavailableError(RuntimeError):
+    """Raised when the Ollama server cannot be reached."""
 
 
-def normalise_dates_in_query(query: str) -> str:
-    found = search_dates(
-        query,
-        languages=["en"],
-        settings={
-            "PREFER_DAY_OF_MONTH": "first",
-            "RETURN_TIME_AS_PERIOD": False,
-            "PREFER_DATES_FROM": "past",
-        },
+# ──────────────────────────────────────────────────────────────────
+# Prompt
+# ──────────────────────────────────────────────────────────────────
+
+def _field_reference() -> str:
+    """Describe the fields the corpus actually contains.
+
+    Generated from config.FIELD_LABELS rather than hand-written: the previous
+    prompt advertised Depth and Quality Flag columns that do not exist in this
+    dataset, inviting the model to invent them.
+    """
+    return "\n".join(
+        f"  {label} ({unit})" for label, unit in config.FIELD_LABELS.values()
     )
 
-    if not found:
-        return query
-
-    result = query
-    replacements = []
-
-    for original_text, parsed_dt in found:
-        if _is_false_positive(query, original_text):
-            continue
-        if re.fullmatch(r"-?\d+(\.\d+)?", original_text.strip()):
-            continue
-        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", original_text.strip()):
-            continue
-
-        iso_date = parsed_dt.strftime("%Y-%m-%d")
-        replacements.append((original_text, iso_date))
-
-    replacements.sort(key=lambda x: len(x[0]), reverse=True)
-    for original_text, iso_date in replacements:
-        result = result.replace(original_text, iso_date, 1)
-
-    if result != query:
-        print(f"[DateParser] '{query}'  →  '{result}'")
-
-    return result
-
-
-class DateAwareRetriever(BaseRetriever):
-    base_retriever: BaseRetriever = Field(...)
-
-    class Config:
-        arbitrary_types_allowed = True
-
-    def _get_relevant_documents(
-        self,
-        query: str,
-        *,
-        run_manager: CallbackManagerForRetrieverRun,
-    ) -> List[Document]:
-        clean_query = normalise_dates_in_query(query)
-        return self.base_retriever.invoke(clean_query)
-
-
-all_documents: List[Document] = list(vectorstore.docstore._dict.values())
-
-bm25_base = BM25Retriever.from_documents(all_documents, k=6)
-
-faiss_base = vectorstore.as_retriever(
-    search_type="mmr",
-    search_kwargs={"k": 6, "fetch_k": 20, "lambda_mult": 0.7},
-)
-
-bm25_retriever  = DateAwareRetriever(base_retriever=bm25_base)
-faiss_retriever = DateAwareRetriever(base_retriever=faiss_base)
-
-ensemble_retriever = EnsembleRetriever(
-    retrievers=[faiss_retriever, bm25_retriever],
-    weights=[0.5, 0.5],
-)
-
-llm = OllamaLLM(
-    model="qwen3:latest",
-    base_url="http://localhost:11434",
-    num_predict=2048,
-    temperature=0.1,
-    top_p=0.75,
-)
 
 PROMPT_TEMPLATE = """You are an expert oceanographer analysing Argo float data.
-Each retrieved record is formatted as labelled pairs:
+Each retrieved record is one profile measurement, formatted as labelled pairs:
   Field Name: value | Field Name: value | ...
 
-Common fields and their units:
-  Date (YYYY-MM-DD), Latitude / Longitude (decimal degrees, negative = S/W),
-  Depth (m), Pressure (dbar), Temperature (°C), Salinity (PSU),
-  Quality Flag (0 = good), Platform / Station ID
+Fields present in this dataset:
+{fields}
 
 Retrieved records:
 {context}
 
 Question: {question}
-
+{caveat}
 Instructions:
-- Answer only from the records above; do not hallucinate values.
-- If the exact date is unavailable use the nearest record and state the actual date and day offset.
-- Quote specific measurements with units and include coordinates.
+- Answer only from the records above; never invent values or fields.
+- If the exact date is unavailable, use the nearest record and state its actual
+  date and the offset in days.
+- Quote measurements with their units and include the coordinates.
+- If the records do not support an answer, say so plainly.
 - Be concise and direct.
 
 Answer:"""
 
+AGGREGATE_CAVEAT = """
+IMPORTANT: this question asks for a statistic across the dataset, but the
+records above are only the top matches, not the full corpus. Do not compute an
+average, total or extreme from them as if it covered everything. Report what
+these specific records show and state clearly that a corpus-wide statistic
+cannot be derived from a retrieval sample.
+"""
+
 PROMPT = PromptTemplate(
     template=PROMPT_TEMPLATE,
-    input_variables=["context", "question"],
-)
-
-qa_chain = RetrievalQA.from_chain_type(
-    llm=llm,
-    chain_type="stuff",
-    retriever=ensemble_retriever,
-    return_source_documents=True,
-    chain_type_kwargs={"prompt": PROMPT},
+    input_variables=["context", "question", "caveat", "fields"],
 )
 
 
-def show_retrieved_docs(docs: list) -> None:
+# ──────────────────────────────────────────────────────────────────
+# LLM
+# ──────────────────────────────────────────────────────────────────
+
+def _call_ollama(prompt: str) -> str:
+    """Generate with Ollama over plain HTTP.
+
+    Avoids the langchain-ollama dependency for what is one POST, and lets us
+    turn a connection refusal into an explanatory error instead of a traceback.
+    """
+    try:
+        response = requests.post(
+            f"{config.OLLAMA_BASE_URL}/api/generate",
+            json={
+                "model": config.OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "num_predict": config.LLM_NUM_PREDICT,
+                    "temperature": config.LLM_TEMPERATURE,
+                    "top_p": config.LLM_TOP_P,
+                    "num_ctx": config.LLM_NUM_CTX,
+                },
+            },
+            timeout=config.LLM_TIMEOUT,
+        )
+    except requests.exceptions.ConnectionError as exc:
+        raise LLMUnavailableError(
+            f"Cannot reach Ollama at {config.OLLAMA_BASE_URL}. "
+            f"Start it with 'ollama serve' and pull the model with "
+            f"'ollama pull {config.OLLAMA_MODEL}'."
+        ) from exc
+    except requests.exceptions.Timeout as exc:
+        raise LLMUnavailableError(
+            f"Ollama did not respond within {config.LLM_TIMEOUT}s."
+        ) from exc
+
+    if response.status_code == 404:
+        raise LLMUnavailableError(
+            f"Model '{config.OLLAMA_MODEL}' is not installed. "
+            f"Run: ollama pull {config.OLLAMA_MODEL}"
+        )
+    response.raise_for_status()
+    return strip_reasoning(response.json().get("response", ""))
+
+
+# qwen3 and other reasoning models emit their chain of thought in <think>
+# blocks. Left in, it reaches the Streamlit UI verbatim and buries the answer.
+_THINK_BLOCK = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
+_UNCLOSED_THINK = re.compile(r"^.*?</think>\s*", re.DOTALL | re.IGNORECASE)
+
+
+def strip_reasoning(text: str) -> str:
+    """Remove <think> blocks from a model response."""
+    cleaned = _THINK_BLOCK.sub("", text)
+    # A response truncated by num_predict can open <think> and never close it;
+    # if a stray closing tag remains, drop everything up to it.
+    if "</think>" in cleaned:
+        cleaned = _UNCLOSED_THINK.sub("", cleaned)
+    return cleaned.strip()
+
+
+# ──────────────────────────────────────────────────────────────────
+# Chain construction (lazy, cached)
+# ──────────────────────────────────────────────────────────────────
+
+def format_docs(docs: List[Document]) -> str:
+    return "\n".join(f"[{i}] {doc.page_content}" for i, doc in enumerate(docs, 1))
+
+
+@lru_cache(maxsize=1)
+def get_retriever(use_bm25: bool = True):
+    """Build the hybrid retriever once and reuse it."""
+    embeddings = load_embeddings()
+    store = load_vectorstore(embeddings)
+
+    dense = DateAwareRetriever(
+        base_retriever=store.as_retriever(
+            search_type="mmr",
+            search_kwargs={
+                "k": config.TOP_K,
+                "fetch_k": config.FETCH_K,
+                "lambda_mult": config.MMR_LAMBDA,
+            },
+        )
+    )
+
+    if not use_bm25:
+        return dense
+
+    lexical = DateAwareRetriever(
+        base_retriever=build_bm25(iter_documents(store), k=config.TOP_K)
+    )
+
+    return FusionRetriever(
+        retrievers=[dense, lexical],
+        weights=[config.DENSE_WEIGHT, config.LEXICAL_WEIGHT],
+        rrf_k=config.RRF_K,
+        top_k=config.TOP_K,
+    )
+
+
+@lru_cache(maxsize=1)
+def get_chain(use_bm25: bool = True):
+    """LCEL chain returning both the answer and the documents it used.
+
+    Replaces RetrievalQA, which lived in `langchain.chains` -- removed in
+    langchain 1.x, so the previous module could not even be imported here.
+    """
+    retriever = get_retriever(use_bm25)
+
+    answer = (
+        {
+            "context": lambda x: format_docs(x["documents"]),
+            "question": lambda x: x["question"],
+            "caveat": lambda x: AGGREGATE_CAVEAT if looks_like_aggregate(x["question"]) else "",
+            "fields": lambda _: _field_reference(),
+        }
+        | PROMPT
+        | RunnableLambda(_call_ollama)
+        | StrOutputParser()
+    )
+
+    return {
+        "question": RunnablePassthrough(),
+        "documents": retriever,
+    } | RunnableParallel(answer=answer, documents=lambda x: x["documents"])
+
+
+# ──────────────────────────────────────────────────────────────────
+# Public API
+# ──────────────────────────────────────────────────────────────────
+
+def show_retrieved_docs(docs: List[Document]) -> None:
     print("\n" + "=" * 60)
     print(f"RETRIEVED DOCUMENTS ({len(docs)} total)")
     print("=" * 60)
@@ -163,20 +238,105 @@ def show_retrieved_docs(docs: list) -> None:
         print("-" * 40)
 
 
-def run_query(query: str, verbose: bool = True):
-    result = qa_chain.invoke({"query": query})
-    answer = result["result"]
-    source_docs = result["source_documents"]
+def run_query(query: str, verbose: bool = True, use_bm25: bool = True):
+    result = get_chain(use_bm25).invoke(query)
+    docs = result["documents"]
     if verbose:
-        show_retrieved_docs(source_docs)
-    return answer, len(source_docs), source_docs
+        show_retrieved_docs(docs)
+    return result["answer"], len(docs), docs
 
 
-def main(query: str) -> tuple[str, int]:
-    answer, num_docs, _ = run_query(query, verbose=True)
-    print(f"\nAnswer ({num_docs} docs used):\n{answer}")
+def main(query: str) -> Tuple[str, int]:
+    """Entry point used by app.py. Errors come back as text, not exceptions,
+    so a missing index or a stopped Ollama shows up in the UI as a message."""
+    try:
+        answer, num_docs, _ = run_query(query, verbose=False)
+    except (VectorstoreMissingError, LLMUnavailableError) as exc:
+        return f"Cannot answer this query: {exc}", 0
     return answer, num_docs
 
 
+def preflight() -> int:
+    """Report exactly which prerequisites are missing, with the fix for each.
+
+    Beats discovering a missing package as a traceback from inside FAISS
+    deserialisation, or a stopped Ollama as a connection error mid-answer.
+    """
+    import importlib.util
+    from pathlib import Path
+
+    problems = []
+
+    for module, fix in [
+        ("langchain_community", "pip install -r requirements.txt"),
+        ("langchain_huggingface", "pip install -r requirements.txt"),
+        ("rank_bm25", "pip install rank-bm25"),
+        ("faiss", "pip install faiss-cpu"),
+        ("dateparser", "pip install dateparser"),
+    ]:
+        ok = importlib.util.find_spec(module) is not None
+        print(f"  [{'ok ' if ok else 'MISSING'}] {module}")
+        if not ok:
+            problems.append(f"{module}: {fix}")
+
+    index = Path(config.VECTORSTORE_PATH) / "index.faiss"
+    if index.exists():
+        print(f"  [ok ] index ({index.stat().st_size / 1e6:.0f} MB)")
+    else:
+        print("  [MISSING] FAISS index")
+        problems.append(f"index: python embed_gen.py --csv {config.CSV_PATH}")
+
+    try:
+        tags = requests.get(f"{config.OLLAMA_BASE_URL}/api/tags", timeout=5).json()
+        models = [m["name"] for m in tags.get("models", [])]
+        if config.OLLAMA_MODEL in models:
+            print(f"  [ok ] ollama, model {config.OLLAMA_MODEL}")
+        else:
+            print(f"  [MISSING] ollama model {config.OLLAMA_MODEL} (have: {models})")
+            problems.append(f"model: ollama pull {config.OLLAMA_MODEL}")
+    except Exception:
+        print(f"  [MISSING] ollama at {config.OLLAMA_BASE_URL}")
+        problems.append("ollama: start it with 'ollama serve'")
+
+    if problems:
+        print("\nTo fix:")
+        for problem in problems:
+            print(f"  - {problem}")
+        return 1
+    print("\nAll checks passed.")
+    return 0
+
+
+def _cli() -> int:
+    parser = argparse.ArgumentParser(description="Query the Argo RAG pipeline.")
+    parser.add_argument("query", nargs="*", help="question to ask")
+    parser.add_argument("--check", action="store_true", help="verify prerequisites and exit")
+    parser.add_argument("-q", "--quiet", action="store_true", help="hide retrieved documents")
+    parser.add_argument("--no-bm25", action="store_true", help="dense retrieval only")
+    parser.add_argument("-k", "--top-k", type=int, help="number of documents to retrieve")
+    args = parser.parse_args()
+
+    if args.check:
+        return preflight()
+
+    if args.top_k:
+        config.TOP_K = args.top_k
+
+    question = " ".join(args.query) or input("Question: ").strip()
+    if not question:
+        parser.error("no question given")
+
+    try:
+        answer, num_docs, _ = run_query(
+            question, verbose=not args.quiet, use_bm25=not args.no_bm25
+        )
+    except (VectorstoreMissingError, LLMUnavailableError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"\nAnswer ({num_docs} docs used):\n{answer}")
+    return 0
+
+
 if __name__ == "__main__":
-    main("What was the temperature on January 3rd, 2023 near 45N 30W?")
+    raise SystemExit(_cli())
