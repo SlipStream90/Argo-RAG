@@ -102,6 +102,7 @@ and returns the same ranking: for unit vectors `||q−d||² = 2 − 2(q·d)`, so
 and inner product order results identically. The distance strategy is detected
 from the index itself at load time, so no re-embedding is required.
 
+
 ## Acknowledgements
 
 Argo data from the Global Argo Data Repository.
